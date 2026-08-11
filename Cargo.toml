@@ -1,0 +1,47 @@
+[package]
+name = "rivine"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rivine-broker"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Config
+config = { version = "0.14", features = ["toml"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Compression (Kafka: gzip/snappy/lz4/zstd)
+flate2 = "1"
+snap = "1"
+lz4_flex = { version = "0.11", features = ["frame"] }
+zstd = "0.13"
+
+# CRC
+crc32fast = "1"
+crc32c = "0.6"
+
+# Concurrency
+dashmap = "6"
+arc-swap = "1"
+
+# Metrics
+prometheus = "0.13"
+
+# Raft consensus (KRaft)
+# We implement custom Raft per the doc for learning purposes; raft crate is optional.

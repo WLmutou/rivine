@@ -1,0 +1,32 @@
+# rivine Broker 配置示例
+# 使用方法: rivine-broker --config config/broker.toml.example
+# 所有配置也可通过环境变量覆盖: RIVINE_<KEY>（如 RIVINE_BROKER_ID=1）
+
+# === 网络 ===
+host = "0.0.0.0"
+port = 9092
+broker_id = 0
+
+# === 存储 ===
+log_dirs = ["/tmp/rivine-logs"]
+log_segment_bytes = 1073741824        # 1GB，段滚动大小阈值
+log_roll_ms = 604800000               # 7 天，段滚动时间阈值
+index_interval_bytes = 4096           # 每 4KB 建一个索引条目
+log_retention_hours = 168             # 7 天，基于时间的保留
+log_retention_bytes = -1              # -1 表示不限制，基于大小保留
+cleanup_policy = "delete"             # delete 或 compact
+log_flush_interval_messages = 10000
+log_flush_interval_ms = 1000
+
+# === 主题/副本 ===
+num_partitions = 1
+default_replication_factor = 1
+min_insync_replicas = 1
+
+# === 集群 ===
+cluster_id = "rivine-cluster"
+single_node = true                    # 单机模式（不启动 Raft）
+# raft_peers = ["127.0.0.1:9093", "127.0.0.1:9094"]   # 多机模式
+
+# === 消费者组 ===
+group_initial_rebalance_delay_ms = 3000
