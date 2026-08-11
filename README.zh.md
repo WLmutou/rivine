@@ -60,7 +60,12 @@ RIVINE_PORT=9093 RIVINE_LOG_DIRS=/var/lib/rivine ./target/release/rivine-broker
 ```bash
 cargo test          # 单元测试（协议编解码、存储、Raft、压缩）
 cargo test --test integration   # 集成测试（TCP 握手 + Produce→Fetch 全链路）
+
+# 压力测试（并发 / 吞吐 / 数据一致性）
+cargo test --test stress -- --ignored --nocapture
 ```
+
+压力测试负载可通过环境变量调节（`RIVINE_STRESS_CONNECTIONS`、`RIVINE_STRESS_MESSAGES`、`RIVINE_STRESS_VALUE_BYTES`）。
 
 ## 项目结构
 

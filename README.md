@@ -61,7 +61,13 @@ RIVINE_PORT=9093 RIVINE_LOG_DIRS=/var/lib/rivine ./target/release/rivine-broker
 ```bash
 cargo test                       # Unit tests (protocol codec, storage, Raft, compression)
 cargo test --test integration    # Integration tests (TCP handshake + full Produce→Fetch flow)
+
+# Stress tests (concurrency / throughput / data consistency)
+cargo test --test stress -- --ignored --nocapture
 ```
+
+Stress test loads can be tuned via environment variables
+(`RIVINE_STRESS_CONNECTIONS`, `RIVINE_STRESS_MESSAGES`, `RIVINE_STRESS_VALUE_BYTES`).
 
 ## Project Structure
 
