@@ -67,21 +67,21 @@ cargo test --test integration    # Integration tests (TCP handshake + full Produ
 
 ```
 src/
-├── protocol/   # Kafka protocol definitions and codecs (Phase 1.1)
+├── protocol/   # Kafka protocol definitions and codecs 
 │   ├── primitive.rs    # Primitive codecs
 │   ├── messages.rs     # Request/response messages
 │   └── recordbatch.rs  # RecordBatch codec + compression
-├── storage/    # Storage engine (Phase 1.2)
+├── storage/    # Storage engine 
 │   ├── segment.rs      # LogSegment
 │   ├── index.rs        # Offset/timestamp index
 │   ├── log.rs          # PartitionLog
 │   └── compaction.rs   # Log compaction
-├── config/     # Configuration management (Phase 1.3)
-├── server/     # Network layer + request handling + LogManager (Phase 2)
-├── cluster/    # Raft/KRaft + Controller (Phase 3)
-├── group/      # Consumer group protocol (Phase 4)
-├── internals/  # Internal topics (Phase 5)
-└── metrics/    # Monitoring (Phase 7.4)
+├── config/     # Configuration management
+├── server/     # Network layer + request handling + LogManager
+├── cluster/    # Raft/KRaft + Controller
+├── group/      # Consumer group protocol 
+├── internals/  # Internal topics 
+└── metrics/    # Monitoring
 ```
 
 ## Compatibility Notes

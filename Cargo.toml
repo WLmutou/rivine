@@ -2,6 +2,14 @@
 name = "rivine"
 version = "0.1.0"
 edition = "2024"
+description = "Apache Kafka® rewritten in Rust — a Kafka-compatible broker from scratch"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/WLmutou/rivine"
+homepage = "https://github.com/WLmutou/rivine"
+documentation = "https://docs.rs/rivine"
+keywords = ["kafka", "broker", "messaging", "protocol", "event-streaming"]
+categories = ["database", "network-programming", "web-programming", "concurrency", "command-line-utilities"]
 
 [[bin]]
 name = "rivine-broker"

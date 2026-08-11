@@ -66,21 +66,21 @@ cargo test --test integration   # 集成测试（TCP 握手 + Produce→Fetch �
 
 ```
 src/
-├── protocol/   # Kafka 协议定义与编解码（第 1.1 节）
+├── protocol/   # Kafka 协议定义与编解码
 │   ├── primitive.rs    # 原语编解码器
 │   ├── messages.rs     # 请求/响应消息
 │   └── recordbatch.rs  # RecordBatch 编解码 + 压缩
-├── storage/    # 存储引擎（第 1.2 节）
+├── storage/    # 存储引擎
 │   ├── segment.rs      # LogSegment
 │   ├── index.rs        # 偏移量/时间戳索引
 │   ├── log.rs          # PartitionLog
 │   └── compaction.rs   # 日志压缩
-├── config/     # 配置管理（第 1.3 节）
-├── server/     # 网络层 + 请求处理 + LogManager（第 2 节）
-├── cluster/    # Raft/KRaft + Controller（第 3 节）
-├── group/      # 消费者组协议（第 4 节）
-├── internals/  # 内部主题（第 5 节）
-└── metrics/    # 监控（第 7.4 节）
+├── config/     # 配置管理
+├── server/     # 网络层 + 请求处理 + LogManager
+├── cluster/    # Raft/KRaft + Controller
+├── group/      # 消费者组协议
+├── internals/  # 内部主题
+└── metrics/    # 监控
 ```
 
 ## 兼容性说明
