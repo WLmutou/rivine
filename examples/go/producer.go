@@ -9,7 +9,7 @@ import (
 func main() {
     // 创建一个写入指定Topic的生产者
     w := &kafka.Writer{
-        Addr:                  kafka.TCP("localhost:9092"), // Kafka 集群地址
+        Addr:                  kafka.TCP("127.0.0.1:9092"), // Kafka 集群地址
         Topic:                 "my-topic-go",                  // 主题名称
         Balancer:              &kafka.LeastBytes{},         // 分区均衡策略
         AllowAutoTopicCreation: true,                       // 允许自动创建不存在的主题

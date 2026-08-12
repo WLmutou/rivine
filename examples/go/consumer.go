@@ -10,8 +10,8 @@ import (
 func main() {
     // 创建一个消费者组模式的 Reader
     r := kafka.NewReader(kafka.ReaderConfig{
-        Brokers:  []string{"localhost:9092"},
-        GroupID:  "my-group",      // 消费者组ID，用于协同消费
+        Brokers:  []string{"127.0.0.1:9092"},
+        GroupID:  "go-group",      // 消费者组ID，用于协同消费
         Topic:    "my-topic-go",
         MinBytes: 1,               // 有任意 1 字节数据即返回（便于小数据量测试）
         MaxBytes: 10e6,            // 10MB
