@@ -6,5 +6,6 @@
 //! - 4.4 Rebalance 协议：状态机 Empty → PreparingRebalance → CompletingRebalance → Stable
 
 pub mod coordinator;
+pub mod offset_store;
 
 pub use coordinator::{GroupCoordinator, GroupState};

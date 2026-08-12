@@ -3,6 +3,8 @@
 //! - __consumer_offsets：消费者组偏移量
 //! - __cluster_metadata：元数据变更日志（KRaft 模式）
 
+pub mod idempotence;
+
 use crate::server::metadata::MetadataManager;
 use std::sync::Arc;
 

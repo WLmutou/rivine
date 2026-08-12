@@ -146,6 +146,23 @@ impl MetadataManager {
         Ok(results.iter().map(|r| (r.base_offset, r.last_offset)).collect())
     }
 
+    /// 追加消息到指定分区（同步路径，用于内部写入如 __consumer_offsets）。
+    pub fn append_records_sync(
+        &self,
+        topic: &str,
+        partition: i32,
+        batches: &[Bytes],
+    ) -> Result<Vec<(i64, i64)>> {
+        let log = self
+            .get_log_arc(topic, partition)
+            .ok_or_else(|| anyhow::anyhow!("分区 {topic}-{partition} 不存在"))?;
+        let mut guard = log
+            .try_write()
+            .map_err(|_| anyhow::anyhow!("分区 {topic}-{partition} 写锁被占用"))?;
+        let results = guard.append(batches)?;
+        Ok(results.iter().map(|r| (r.base_offset, r.last_offset)).collect())
+    }
+
     /// 从分区读取消息。返回 (数据, 高水位)。
     pub async fn read_records(
         &self,
@@ -156,6 +173,21 @@ impl MetadataManager {
     ) -> Option<(Bytes, i64)> {
         let log = self.get_log_arc(topic, partition)?;
         let guard = log.read().await;
+        let hw = guard.high_watermark();
+        let data = guard.read(start_offset, max_bytes);
+        Some((data, hw))
+    }
+
+    /// 从分区读取消息（同步路径，用于内部恢复如 __consumer_offsets）。
+    pub fn read_records_sync(
+        &self,
+        topic: &str,
+        partition: i32,
+        start_offset: i64,
+        max_bytes: usize,
+    ) -> Option<(Bytes, i64)> {
+        let log = self.get_log_arc(topic, partition)?;
+        let guard = log.try_read().ok()?;
         let hw = guard.high_watermark();
         let data = guard.read(start_offset, max_bytes);
         Some((data, hw))

@@ -7,7 +7,7 @@
 
 use super::handler::RequestHandler;
 use super::metadata::MetadataManager;
-use crate::cluster::ClusterController;
+use crate::cluster::{ClusterController, MemTransport};
 use crate::config::BrokerConfig;
 use crate::group::GroupCoordinator;
 use crate::internals::InternalTopics;
@@ -26,6 +26,9 @@ pub struct Broker {
     pub groups: Arc<GroupCoordinator>,
     pub controller: Arc<ClusterController>,
     pub metrics: Arc<Metrics>,
+    /// 多机模式的集群传输与节点列表（single_node 时为空）。
+    pub raft_transport: Option<MemTransport>,
+    pub raft_nodes: Vec<u64>,
 }
 
 impl Broker {
@@ -42,7 +45,17 @@ impl Broker {
             groups,
             controller,
             metrics,
+            raft_transport: None,
+            raft_nodes: Vec::new(),
         }
+    }
+
+    /// 配置多机模式的 Raft 集群（single_node=false 时启用）。
+    /// `transport` 为进程内共享的内存传输，`nodes` 为集群全部节点 id。
+    pub fn with_raft_cluster(mut self, transport: MemTransport, nodes: Vec<u64>) -> Self {
+        self.raft_transport = Some(transport);
+        self.raft_nodes = nodes;
+        self
     }
 
     /// 启动 Broker：初始化内部主题、恢复日志，然后监听端口。
@@ -56,6 +69,15 @@ impl Broker {
         self.groups.init();
         // 启动组成员过期清理后台任务。
         self.groups.spawn_expiry_cleanup();
+
+        // 多机模式：启动本节点的 Raft 驱动（参与选举与日志复制）。
+        if !self.config.single_node {
+            if let (Some(transport), nodes) = (self.raft_transport.clone(), self.raft_nodes.clone()) {
+                if !nodes.is_empty() {
+                    self.controller.start_raft(transport, nodes);
+                }
+            }
+        }
 
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let listener = TcpListener::bind(&addr).await?;

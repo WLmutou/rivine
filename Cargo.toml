@@ -47,6 +47,9 @@ crc32c = "0.6"
 dashmap = "6"
 arc-swap = "1"
 
+# Async stream utilities (Raft driver election)
+futures-util = "0.3"
+
 # Metrics
 prometheus = "0.13"
 

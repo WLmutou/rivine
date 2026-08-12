@@ -6,6 +6,7 @@
 
 use super::metadata::{MetadataManager, TopicInfo};
 use crate::group::GroupCoordinator;
+use crate::internals::idempotence::IdempotentStateManager;
 use crate::metrics::Metrics;
 use crate::protocol::*;
 use bytes::Bytes;
@@ -21,6 +22,7 @@ pub struct RequestHandler {
     metadata: Arc<MetadataManager>,
     groups: Arc<GroupCoordinator>,
     metrics: Arc<Metrics>,
+    idempotent: Arc<IdempotentStateManager>,
     broker_host: String,
     broker_port: i32,
     broker_id: i32,
@@ -37,6 +39,7 @@ impl RequestHandler {
             metadata,
             groups,
             metrics,
+            idempotent: Arc::new(IdempotentStateManager::new()),
             broker_host: "127.0.0.1".to_string(),
             broker_port: 9092,
             broker_id: 0,
@@ -254,6 +257,47 @@ impl RequestHandler {
                         .metadata
                         .create_topic(&t.topic, self.metadata.default_partitions(), false);
                 }
+
+                // 幂等校验：解析批次中的 producer_id/epoch/base_sequence。
+                // 若解析失败（如消息格式非 RecordBatch v2），跳过校验。
+                let idem_err = crate::protocol::recordbatch::RecordBatch::parse(p.records.clone())
+                    .ok()
+                    .and_then(|batch| {
+                        let last_offset_delta = batch.last_offset_delta;
+                        let last_sequence = batch.base_sequence.saturating_add(last_offset_delta);
+                        self.idempotent
+                            .validate_and_advance(
+                                batch.producer_id,
+                                batch.producer_epoch,
+                                &t.topic,
+                                p.partition_index,
+                                batch.base_sequence,
+                                last_offset_delta,
+                            )
+                            .err()
+                            .map(|code| {
+                                tracing::debug!(
+                                    "幂等拒绝: producer_id={} seq={} last={} err={}",
+                                    batch.producer_id,
+                                    batch.base_sequence,
+                                    last_sequence,
+                                    code
+                                );
+                                code
+                            })
+                    });
+
+                if let Some(code) = idem_err {
+                    partitions.push(ProduceResponsePartition {
+                        partition_index: p.partition_index,
+                        error_code: code,
+                        base_offset: -1,
+                        log_append_time_ms: -1,
+                        log_start_offset: -1,
+                    });
+                    continue;
+                }
+
                 let result = self
                     .metadata
                     .append_records(&t.topic, p.partition_index, &[p.records.clone()])

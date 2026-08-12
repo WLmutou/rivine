@@ -3,12 +3,13 @@
 //! 维护每个消费者组的状态，处理 JoinGroup/SyncGroup/Heartbeat/LeaveGroup，
 //! 并管理 Offset 提交（写入 __consumer_offsets）。
 
+use super::offset_store::OffsetStore;
 use crate::protocol::error_codes;
 use crate::server::metadata::MetadataManager;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Rebalance 状态机状态
@@ -58,38 +59,30 @@ impl Group {
     }
 }
 
-/// 已提交的消费偏移量：group_id -> topic -> partition -> (offset, metadata)
-pub type CommittedOffsets = DashMap<String, HashMap<String, HashMap<i32, (i64, Option<String>)>>>;
-
 /// Group Coordinator
 pub struct GroupCoordinator {
-    metadata: Arc<MetadataManager>,
     /// group_id -> Group
     pub groups: DashMap<String, Group>,
-    /// 已提交的消费偏移量（单机内存实现）
-    pub offsets: CommittedOffsets,
+    /// 已提交的消费偏移量（持久化到 __consumer_offsets）
+    pub offset_store: Arc<Mutex<OffsetStore>>,
     /// __consumer_offsets 的分区数
     pub offsets_topic_partitions: i32,
 }
 
 impl GroupCoordinator {
     pub fn new(metadata: Arc<MetadataManager>) -> Self {
+        let offset_store = Arc::new(Mutex::new(OffsetStore::new(metadata)));
         Self {
-            metadata,
             groups: DashMap::new(),
-            offsets: DashMap::new(),
+            offset_store,
             offsets_topic_partitions: 50,
         }
     }
 
-    /// 启动：确保 __consumer_offsets 内部主题存在。
+    /// 启动：确保 __consumer_offsets 内部主题存在，并恢复已提交的偏移量。
     pub fn init(&self) {
-        if let Err(e) = self
-            .metadata
-            .create_internal_topic("__consumer_offsets", self.offsets_topic_partitions)
-        {
-            tracing::warn!("创建 __consumer_offsets 失败: {e}");
-        }
+        self.offset_store.lock().unwrap().ensure_created();
+        self.offset_store.lock().unwrap().recover();
     }
 
     /// 启动后台任务：周期性清理超过 SessionTimeout 未心跳的组成员，
@@ -322,7 +315,7 @@ impl GroupCoordinator {
         0
     }
 
-    /// 提交偏移量（单机内存实现）。返回提交的偏移量。
+    /// 提交偏移量（持久化到 __consumer_offsets）。
     pub fn commit_offset(
         &self,
         group_id: &str,
@@ -331,23 +324,18 @@ impl GroupCoordinator {
         offset: i64,
         metadata: Option<String>,
     ) {
-        let mut group_offsets = self
-            .offsets
-            .entry(group_id.to_string())
-            .or_insert_with(HashMap::new);
-        let topics = group_offsets
-            .entry(topic.to_string())
-            .or_insert_with(HashMap::new);
-        topics.insert(partition, (offset, metadata));
+        self.offset_store
+            .lock()
+            .unwrap()
+            .commit(group_id, topic, partition, offset, metadata);
     }
 
     /// 查询偏移量。
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: i32) -> Option<i64> {
-        self.offsets
-            .get(group_id)?
-            .get(topic)?
-            .get(&partition)
-            .map(|(offset, _)| *offset)
+        self.offset_store
+            .lock()
+            .unwrap()
+            .fetch_offset(group_id, topic, partition)
     }
 
     /// 查询偏移量及元数据。
@@ -357,7 +345,10 @@ impl GroupCoordinator {
         topic: &str,
         partition: i32,
     ) -> Option<(i64, Option<String>)> {
-        self.offsets.get(group_id)?.get(topic)?.get(&partition).cloned()
+        self.offset_store
+            .lock()
+            .unwrap()
+            .fetch_offset_with_meta(group_id, topic, partition)
     }
 
     /// 列出所有消费者组（用于 ListGroups）。
@@ -369,8 +360,7 @@ impl GroupCoordinator {
             result.push((g.group_id.clone(), g.protocol_type.clone()));
         }
         // 补充仅有 offset 提交、但未通过 JoinGroup 注册的组。
-        for offset_group in self.offsets.iter() {
-            let gid = offset_group.key().clone();
+        for gid in self.offset_store.lock().unwrap().groups_with_offsets() {
             if !result.iter().any(|(id, _)| *id == gid) {
                 result.push((gid, String::new()));
             }

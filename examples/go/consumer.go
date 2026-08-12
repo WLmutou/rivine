@@ -12,7 +12,7 @@ func main() {
     r := kafka.NewReader(kafka.ReaderConfig{
         Brokers:  []string{"localhost:9092"},
         GroupID:  "my-group",      // 消费者组ID，用于协同消费
-        Topic:    "my-topic",
+        Topic:    "my-topic-go",
         MinBytes: 1,               // 有任意 1 字节数据即返回（便于小数据量测试）
         MaxBytes: 10e6,            // 10MB
         MaxWait:  1 * time.Second, // 最多等待 1 秒，避免无数据时长时间阻塞

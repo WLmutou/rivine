@@ -191,6 +191,22 @@ impl RaftNode {
         }
     }
 
+    /// Leader 追加一条业务日志条目（数据复制入口）。
+    /// 仅 Leader 可调用；返回新条目的 index。
+    pub fn append_log(&mut self, data: Vec<u8>) -> Option<u64> {
+        if self.role != NodeRole::Leader {
+            return None;
+        }
+        let index = self.log.last().map(|e| e.index).unwrap_or(0) + 1;
+        let entry = LogEntry {
+            term: self.current_term,
+            index,
+            data,
+        };
+        self.log.push(entry);
+        Some(index)
+    }
+
     /// 等待下一次心跳 tick（返回时即可发送心跳）。
     pub async fn tick(&mut self) {
         if self.heartbeat_tick.is_none() {

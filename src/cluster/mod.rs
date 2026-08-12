@@ -6,6 +6,9 @@
 
 pub mod raft;
 pub mod controller;
+pub mod transport;
+pub mod driver;
 
 pub use controller::ClusterController;
 pub use raft::{NodeRole, RaftNode};
+pub use transport::MemTransport;

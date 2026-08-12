@@ -78,6 +78,12 @@ pub mod error_codes {
     pub const UNKNOWN_MEMBER_ID_NEW: i16 = 82;
     pub const FETCH_SESSION_ID_NOT_FOUND: i16 = 89;
     pub const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
+    pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
+    pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
+    pub const INVALID_PRODUCER_EPOCH: i16 = 47;
+    pub const INVALID_TXN_STATE: i16 = 48;
+    pub const INVALID_PRODUCER_ID_MAPPING: i16 = 49;
+    pub const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 }
 
 /// 请求头
