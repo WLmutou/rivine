@@ -145,7 +145,6 @@ impl RecordBatch {
             }
             put_varint_len(&mut body, r.headers.len() as i64);
             for (k, v) in &r.headers {
-                body.put_i8(0); // header key length 之后的属性（无压缩时固定 0）
                 let kb = k.as_bytes();
                 put_varint_len(&mut body, kb.len() as i64);
                 body.put_slice(kb);
@@ -328,9 +327,11 @@ fn parse_single_record(data: &[u8], pos: &mut usize, end: usize) -> Result<Recor
     let n_headers = read_varint(data, pos)? as i32;
     let mut headers = Vec::new();
     for _ in 0..n_headers {
-        let _header_attr = data[*pos] as i8;
-        *pos += 1;
+        // Header 格式：HeaderKeyLen(uvarlong) HeaderKey HeaderValueLen HeaderValue
         let hk_len = read_varint(data, pos)?;
+        if hk_len < 0 {
+            return Err(Error::Decode("非法的 header key 长度".into()));
+        }
         let hk = String::from_utf8(data[*pos..*pos + hk_len as usize].to_vec())
             .map_err(|e| Error::Decode(format!("header key utf8: {e}")))?;
         *pos += hk_len as usize;
@@ -526,6 +527,36 @@ mod tests {
             assert_eq!(parsed.base_offset, 0);
             assert_eq!(parsed.last_offset(), 1);
         }
+    }
+
+    #[test]
+    fn test_recordbatch_headers_roundtrip() {
+        // 多个 header、不同 key/value 长度，验证与 Kafka magic=2 Header 格式一致
+        // （Header 无 attributes 字段，仅 HeaderKeyLen HeaderKey HeaderValueLen HeaderValue）。
+        let records = vec![
+            Record {
+                attributes: 0,
+                timestamp_delta: 0,
+                offset_delta: 0,
+                key: Some(Bytes::from("k")),
+                value: Some(Bytes::from("v")),
+                headers: vec![
+                    ("my-header".to_string(), Some(Bytes::from("value"))),
+                    ("empty-val".to_string(), Some(Bytes::from(""))),
+                    ("null-val".to_string(), None),
+                    ("no-key-prefix".to_string(), Some(Bytes::from("x"))),
+                ],
+            },
+        ];
+        let bytes = RecordBatch::serialize(0, records.clone(), Compression::None, 1_000, 0, 0, 0, 0);
+        let parsed = RecordBatch::parse(bytes).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        let r = &parsed.records[0];
+        assert_eq!(r.headers.len(), 4);
+        assert_eq!(r.headers[0], ("my-header".to_string(), Some(Bytes::from("value"))));
+        assert_eq!(r.headers[1], ("empty-val".to_string(), Some(Bytes::from(""))));
+        assert_eq!(r.headers[2], ("null-val".to_string(), None));
+        assert_eq!(r.headers[3], ("no-key-prefix".to_string(), Some(Bytes::from("x"))));
     }
 
     #[test]

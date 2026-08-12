@@ -35,6 +35,8 @@ pub mod apikey {
     pub const CREATE_TOPICS: i16 = 19;
     pub const DELETE_TOPICS: i16 = 20;
     pub const INIT_PRODUCER_ID: i16 = 22;
+    pub const DESCRIBE_GROUPS: i16 = 15;
+    pub const LIST_GROUPS: i16 = 16;
 }
 
 /// Kafka 错误码
@@ -63,7 +65,12 @@ pub mod error_codes {
     pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
     pub const INVALID_GROUP_ID: i16 = 24;
     pub const UNKNOWN_MEMBER_ID: i16 = 25;
+    pub const INVALID_SESSION_TIMEOUT: i16 = 26;
     pub const REBALANCE_IN_PROGRESS: i16 = 27;
+    pub const INVALID_COMMIT_OFFSET_SIZE: i16 = 28;
+    pub const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+    pub const GROUP_AUTHORIZATION_FAILED: i16 = 30;
+    pub const OFFSET_METADATA_TOO_LARGE: i16 = 12;
     pub const UNSUPPORTED_VERSION: i16 = 35;
     pub const TOPIC_ALREADY_EXISTS: i16 = 36;
     pub const INVALID_PARTITIONS: i16 = 37;
@@ -128,6 +135,8 @@ fn request_header_is_flexible(api_key: i16, api_version: i16) -> bool {
         apikey::LEAVE_GROUP => 4,
         apikey::SYNC_GROUP => 4,
         apikey::API_VERSIONS => 3,
+        apikey::DESCRIBE_GROUPS => 5,
+        apikey::LIST_GROUPS => 4,
         apikey::CREATE_TOPICS => 5,
         apikey::DELETE_TOPICS => 4,
         // 未知 API 默认不消费 tagged fields

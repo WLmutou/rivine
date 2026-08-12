@@ -165,6 +165,173 @@ async fn test_broker_starts_and_creates_internal_topics() {
     );
 }
 
+/// 构建 OffsetCommit v2 请求（simple consumer 视角：generation=-1、空 member）。
+fn build_offset_commit_request(
+    correlation_id: i32,
+    group: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.put_i16(8); // OffsetCommit
+    e.put_i16(2);
+    e.put_i32(correlation_id);
+    e.put_i16(-1); // client_id null
+    // OffsetCommit v2 请求体（非紧凑）
+    e.put_string(group); // group_id
+    e.put_i32(-1); // generation_id (simple consumer)
+    e.put_string(""); // member_id 空
+    e.put_i64(-1); // retention_time
+    e.put_i32(1); // 1 topic
+    e.put_string(topic);
+    e.put_i32(1); // 1 partition
+    e.put_i32(partition);
+    e.put_i64(offset);
+    e.put_nullable_string(None); // metadata
+    e.into_bytes().to_vec()
+}
+
+/// 构建 OffsetFetch v1 请求。
+fn build_offset_fetch_request(
+    correlation_id: i32,
+    group: &str,
+    topic: &str,
+    partition: i32,
+) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.put_i16(9); // OffsetFetch
+    e.put_i16(1);
+    e.put_i32(correlation_id);
+    e.put_i16(-1); // client_id null
+    e.put_string(group);
+    e.put_i32(1); // 1 topic
+    e.put_string(topic);
+    e.put_i32(1); // 1 partition
+    e.put_i32(partition);
+    e.into_bytes().to_vec()
+}
+
+/// 构建 ListGroups v1 请求（空请求体）。
+fn build_list_groups_request(correlation_id: i32) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.put_i16(16); // ListGroups
+    e.put_i16(1);
+    e.put_i32(correlation_id);
+    e.put_i16(-1); // client_id null
+    // v1 请求体为空
+    e.into_bytes().to_vec()
+}
+
+/// 构建 DescribeGroups v1 请求。
+fn build_describe_groups_request(correlation_id: i32, group: &str) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.put_i16(15); // DescribeGroups
+    e.put_i16(1);
+    e.put_i32(correlation_id);
+    e.put_i16(-1); // client_id null
+    e.put_i32(1); // 1 个 group
+    e.put_string(group);
+    e.into_bytes().to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_offset_commit_and_fetch() {
+    init_tracing();
+    let broker = start_test_broker(19195, "offset").await;
+    broker
+        .metadata
+        .create_topic("offset-topic", 1, false)
+        .expect("创建主题失败");
+
+    // 1. 尚未提交时，OffsetFetch 应返回 offset=-1（无错误码）。
+    let fetch_req = build_offset_fetch_request(1, "test-group", "offset-topic", 0);
+    let fetch_resp = send_raw(19195, &fetch_req);
+    let mut d = Decoder::new(Bytes::from(fetch_resp[4..].to_vec()));
+    let n_topics = d.get_i32().unwrap();
+    assert_eq!(n_topics, 1);
+    let topic = d.get_string().unwrap();
+    assert_eq!(topic, "offset-topic");
+    let n_part = d.get_i32().unwrap();
+    assert_eq!(n_part, 1);
+    let _partition = d.get_i32().unwrap();
+    let offset = d.get_i64().unwrap();
+    assert_eq!(offset, -1, "未提交的 offset 应为 -1");
+    let meta = d.get_nullable_string().unwrap();
+    assert!(meta.is_none());
+
+    // 2. 提交 offset。
+    let commit_req = build_offset_commit_request(2, "test-group", "offset-topic", 0, 42);
+    let commit_resp = send_raw(19195, &commit_req);
+    let mut d2 = Decoder::new(Bytes::from(commit_resp[4..].to_vec()));
+    let n_topics = d2.get_i32().unwrap();
+    assert_eq!(n_topics, 1);
+    let _topic = d2.get_string().unwrap();
+    let n_part = d2.get_i32().unwrap();
+    assert_eq!(n_part, 1);
+    let _partition = d2.get_i32().unwrap();
+    let err = d2.get_i16().unwrap();
+    assert_eq!(err, 0, "OffsetCommit 应成功");
+
+    // 3. 再次 OffsetFetch，应取回已提交的 offset=42。
+    let fetch_req2 = build_offset_fetch_request(3, "test-group", "offset-topic", 0);
+    let fetch_resp2 = send_raw(19195, &fetch_req2);
+    let mut d3 = Decoder::new(Bytes::from(fetch_resp2[4..].to_vec()));
+    let _n_topics = d3.get_i32().unwrap();
+    let _topic = d3.get_string().unwrap();
+    let _n_part = d3.get_i32().unwrap();
+    let _partition = d3.get_i32().unwrap();
+    let offset2 = d3.get_i64().unwrap();
+    assert_eq!(offset2, 42, "应取回已提交的 offset=42");
+    let _ = broker;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_list_groups_and_describe_groups() {
+    init_tracing();
+    let broker = start_test_broker(19196, "groups").await;
+    broker
+        .metadata
+        .create_topic("groups-topic", 1, false)
+        .expect("创建主题失败");
+
+    // 提交一个 offset，触发 group 注册（list_groups 会列出该 group）。
+    let commit_req = build_offset_commit_request(1, "mgmt-group", "groups-topic", 0, 10);
+    send_raw(19196, &commit_req);
+
+    // ListGroups v1：应包含 mgmt-group。
+    let list_req = build_list_groups_request(2);
+    let list_resp = send_raw(19196, &list_req);
+    let mut d = Decoder::new(Bytes::from(list_resp[4..].to_vec()));
+    let _throttle = d.get_i32().unwrap();
+    let n_groups = d.get_i32().unwrap();
+    let mut found = false;
+    for _ in 0..n_groups {
+        let gid = d.get_string().unwrap();
+        let _ptype = d.get_string().unwrap();
+        if gid == "mgmt-group" {
+            found = true;
+        }
+    }
+    assert!(found, "ListGroups 应包含 mgmt-group");
+
+    // DescribeGroups v1：应能描述 mgmt-group（空/稳定状态）。
+    let desc_req = build_describe_groups_request(3, "mgmt-group");
+    let desc_resp = send_raw(19196, &desc_req);
+    let mut d2 = Decoder::new(Bytes::from(desc_resp[4..].to_vec()));
+    let _throttle = d2.get_i32().unwrap();
+    let n_desc = d2.get_i32().unwrap();
+    assert_eq!(n_desc, 1);
+    let _err = d2.get_i16().unwrap();
+    let gid = d2.get_string().unwrap();
+    assert_eq!(gid, "mgmt-group");
+    let _state = d2.get_string().unwrap();
+    let _ptype = d2.get_string().unwrap();
+    let _pdata = d2.get_string().unwrap();
+    let _n_members = d2.get_i32().unwrap();
+    let _ = broker;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_produce_then_fetch() {
     init_tracing();

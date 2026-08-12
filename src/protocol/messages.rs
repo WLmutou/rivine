@@ -905,3 +905,149 @@ impl DeleteTopicsRequest {
         })
     }
 }
+
+// ============================ ListGroups ============================
+
+#[derive(Debug, Clone)]
+pub struct ListGroupsRequest {
+    pub states_filter: Vec<String>,
+}
+
+impl ListGroupsRequest {
+    pub fn decode(buf: &mut Decoder, version: i16) -> Result<Self> {
+        // v0-v1 请求体为空。v4+ 为 compact，states_filter 自 v4 起出现。
+        let states_filter = if version >= 4 {
+            let n = buf.get_unsigned_varint()? as usize;
+            let mut states = Vec::new();
+            for _ in 0..n {
+                if let Some(s) = buf.get_compact_string().ok() {
+                    states.push(s);
+                }
+            }
+            states
+        } else {
+            Vec::new()
+        };
+        Ok(Self { states_filter })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListedGroup {
+    pub group_id: String,
+    pub protocol_type: String,
+    pub group_state: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListGroupsResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: i16,
+    pub groups: Vec<ListedGroup>,
+}
+
+impl ListGroupsResponse {
+    pub fn encode(&self, e: &mut Encoder, version: i16) {
+        // ThrottleTimeMs 仅 v1+ 存在；v0 无 throttle。
+        if version >= 1 {
+            e.put_i32(self.throttle_time_ms);
+        }
+        // ErrorCode 仅 v2+ 存在。
+        if version >= 2 {
+            e.put_i16(self.error_code);
+        }
+        e.put_i32(self.groups.len() as i32);
+        for g in &self.groups {
+            e.put_string(&g.group_id);
+            e.put_string(&g.protocol_type);
+            if version >= 4 {
+                e.put_string(&g.group_state);
+            }
+        }
+    }
+}
+
+// ============================ DescribeGroups ============================
+
+#[derive(Debug, Clone)]
+pub struct DescribeGroupsRequest {
+    pub groups: Vec<String>,
+    pub include_authorized_operations: bool,
+}
+
+impl DescribeGroupsRequest {
+    pub fn decode(buf: &mut Decoder, version: i16) -> Result<Self> {
+        let n = buf.get_i32()?;
+        let mut groups = Vec::new();
+        for _ in 0..n {
+            groups.push(buf.get_string()?);
+        }
+        // include_authorized_operations 仅 v3+ 存在。
+        let include_authorized_operations = if version >= 3 {
+            buf.get_i8()? != 0
+        } else {
+            false
+        };
+        Ok(Self {
+            groups,
+            include_authorized_operations,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribedGroupMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub client_id: String,
+    pub client_host: String,
+    pub member_metadata: Bytes,
+    pub member_assignment: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribedGroup {
+    pub error_code: i16,
+    pub group_id: String,
+    pub group_state: String,
+    pub protocol_type: String,
+    pub protocol_data: String,
+    pub members: Vec<DescribedGroupMember>,
+    pub authorized_operations: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DescribeGroupsResponse {
+    pub throttle_time_ms: i32,
+    pub groups: Vec<DescribedGroup>,
+}
+
+impl DescribeGroupsResponse {
+    pub fn encode(&self, e: &mut Encoder, version: i16) {
+        e.put_i32(self.throttle_time_ms);
+        e.put_i32(self.groups.len() as i32);
+        for g in &self.groups {
+            e.put_i16(g.error_code);
+            e.put_string(&g.group_id);
+            e.put_string(&g.group_state);
+            e.put_string(&g.protocol_type);
+            e.put_string(&g.protocol_data);
+            e.put_i32(g.members.len() as i32);
+            for m in &g.members {
+                e.put_string(&m.member_id);
+                if version >= 5 {
+                    e.put_nullable_string(m.group_instance_id.as_deref());
+                }
+                e.put_string(&m.client_id);
+                e.put_string(&m.client_host);
+                e.put_i32(m.member_metadata.len() as i32);
+                e.put_bytes(&m.member_metadata);
+                e.put_i32(m.member_assignment.len() as i32);
+                e.put_bytes(&m.member_assignment);
+            }
+            if version >= 3 {
+                e.put_i32(g.authorized_operations);
+            }
+        }
+    }
+}

@@ -7,4 +7,4 @@
 
 pub mod coordinator;
 
-pub use coordinator::GroupCoordinator;
+pub use coordinator::{GroupCoordinator, GroupState};

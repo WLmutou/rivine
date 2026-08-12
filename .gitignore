@@ -1,3 +1,6 @@
 /target
+/examples/rust/kafka-producer/target
+/examples/rust/kafka-consumer/target
 consumer
 producer
+kafka_protocol.md

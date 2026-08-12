@@ -176,6 +176,11 @@ impl PartitionLog {
         self.high_watermark
     }
 
+    /// 日志起始偏移量（最旧可用偏移量，受保留清理影响）。
+    pub fn log_start(&self) -> i64 {
+        self.log_start_offset
+    }
+
     /// 高水位（当前实现 LEO 即 HW，单机模式）。
     pub fn high_watermark(&self) -> i64 {
         self.high_watermark

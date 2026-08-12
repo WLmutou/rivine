@@ -173,6 +173,12 @@ impl MetadataManager {
         log.try_read().ok().map(|l| l.leo())
     }
 
+    /// 同步获取分区日志起始偏移量。
+    pub fn partition_log_start_sync(&self, topic: &str, partition: i32) -> Option<i64> {
+        let log = self.get_log_arc(topic, partition)?;
+        log.try_read().ok().map(|l| l.log_start())
+    }
+
     /// 获取分区日志的 Arc 引用。
     pub fn get_log_arc(&self, topic: &str, partition: i32) -> Option<Arc<RwLock<PartitionLog>>> {
         self.logs.get(topic)?.get(&partition).map(|l| l.clone())

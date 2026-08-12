@@ -54,6 +54,8 @@ impl Broker {
         let internals = InternalTopics::new(self.metadata.clone());
         internals.ensure_created();
         self.groups.init();
+        // 启动组成员过期清理后台任务。
+        self.groups.spawn_expiry_cleanup();
 
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let listener = TcpListener::bind(&addr).await?;
@@ -117,10 +119,14 @@ async fn handle_connection(
         reader.read_exact(&mut buf).await?;
         let body = Bytes::copy_from_slice(&buf);
 
-        // 3. 处理请求并获取响应
+        // 3. 处理请求并获取响应。
+        //    `None` 表示该请求按协议约定不返回响应（如 Produce acks=0，fire-and-forget）。
         let response = handler.process(body).await;
 
-        // 4. 写回响应（4 字节长度前缀 + 响应体）
+        // 4. 写回响应（4 字节长度前缀 + 响应体）。
+        let Some(response) = response else {
+            continue;
+        };
         let resp_len = response.len() as u32;
         writer.write_all(&resp_len.to_be_bytes()).await?;
         writer.write_all(&response).await?;

@@ -3,6 +3,7 @@
 //! 维护每个消费者组的状态，处理 JoinGroup/SyncGroup/Heartbeat/LeaveGroup，
 //! 并管理 Offset 提交（写入 __consumer_offsets）。
 
+use crate::protocol::error_codes;
 use crate::server::metadata::MetadataManager;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -32,7 +33,7 @@ pub struct Member {
 }
 
 /// 消费者组
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Group {
     pub group_id: String,
     pub state: GroupState,
@@ -57,11 +58,16 @@ impl Group {
     }
 }
 
+/// 已提交的消费偏移量：group_id -> topic -> partition -> (offset, metadata)
+pub type CommittedOffsets = DashMap<String, HashMap<String, HashMap<i32, (i64, Option<String>)>>>;
+
 /// Group Coordinator
 pub struct GroupCoordinator {
     metadata: Arc<MetadataManager>,
     /// group_id -> Group
     pub groups: DashMap<String, Group>,
+    /// 已提交的消费偏移量（单机内存实现）
+    pub offsets: CommittedOffsets,
     /// __consumer_offsets 的分区数
     pub offsets_topic_partitions: i32,
 }
@@ -71,6 +77,7 @@ impl GroupCoordinator {
         Self {
             metadata,
             groups: DashMap::new(),
+            offsets: DashMap::new(),
             offsets_topic_partitions: 50,
         }
     }
@@ -83,6 +90,50 @@ impl GroupCoordinator {
         {
             tracing::warn!("创建 __consumer_offsets 失败: {e}");
         }
+    }
+
+    /// 启动后台任务：周期性清理超过 SessionTimeout 未心跳的组成员，
+    /// 并在成员被移除后触发 Rebalance（与 Kafka 的成员过期机制一致）。
+    pub fn spawn_expiry_cleanup(&self) {
+        let groups = self.groups.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.tick().await; // 首个 tick 立即返回，跳过
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                for mut entry in groups.iter_mut() {
+                    let group = entry.value_mut();
+                    let expired: Vec<String> = group
+                        .members
+                        .iter()
+                        .filter(|(_, m)| {
+                            now.duration_since(m.last_heartbeat).as_millis()
+                                > m.session_timeout_ms as u128
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    if !expired.is_empty() {
+                        for id in &expired {
+                            group.members.remove(id);
+                        }
+                        // 移除成员后触发 Rebalance（进入 PreparingRebalance）。
+                        if !group.members.is_empty() {
+                            group.state = GroupState::PreparingRebalance;
+                            group.leader_id = None;
+                            group.protocol = None;
+                            tracing::debug!(
+                                "组 {} 成员过期被移除: {:?}，触发 Rebalance",
+                                group.group_id,
+                                expired
+                            );
+                        } else {
+                            group.state = GroupState::Empty;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// 计算 group.id 对应的 Coordinator 分区：hash(group) % num_partitions
@@ -103,10 +154,36 @@ impl GroupCoordinator {
         protocol_type: &str,
         protocols: Vec<(String, Bytes)>,
     ) -> (i16, i32, String, String, Option<String>, Vec<(String, Bytes)>) {
+        // 校验 SessionTimeout（Kafka 要求 6-300000ms）。
+        if session_timeout_ms < 0 {
+            return (error_codes::INVALID_SESSION_TIMEOUT, 0, String::new(), String::new(), None, vec![]);
+        }
+        // 校验协议类型一致性。
         let mut group = self
             .groups
             .entry(group_id.to_string())
             .or_insert_with(|| Group::new(group_id));
+        if !group.protocol_type.is_empty() && group.protocol_type != protocol_type {
+            return (
+                error_codes::INCONSISTENT_GROUP_PROTOCOL,
+                0,
+                String::new(),
+                String::new(),
+                None,
+                vec![],
+            );
+        }
+        // 校验协议列表非空。
+        if protocols.is_empty() {
+            return (
+                error_codes::INCONSISTENT_GROUP_PROTOCOL,
+                0,
+                String::new(),
+                String::new(),
+                None,
+                vec![],
+            );
+        }
 
         // 清理超过 session 超时未心跳的成员（模拟 Kafka 的成员过期机制）。
         let now = Instant::now();
@@ -245,16 +322,92 @@ impl GroupCoordinator {
         0
     }
 
-    /// 提交偏移量（写入 __consumer_offsets 或内存表）。
-    pub fn commit_offset(&self, group_id: &str, topic: &str, partition: i32, offset: i64) {
-        // 单机实现：直接写入 __consumer_offsets 分区日志（由调用方处理）
-        let _ = (group_id, topic, partition, offset);
+    /// 提交偏移量（单机内存实现）。返回提交的偏移量。
+    pub fn commit_offset(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        metadata: Option<String>,
+    ) {
+        let mut group_offsets = self
+            .offsets
+            .entry(group_id.to_string())
+            .or_insert_with(HashMap::new);
+        let topics = group_offsets
+            .entry(topic.to_string())
+            .or_insert_with(HashMap::new);
+        topics.insert(partition, (offset, metadata));
     }
 
     /// 查询偏移量。
     pub fn fetch_offset(&self, group_id: &str, topic: &str, partition: i32) -> Option<i64> {
-        let _ = (group_id, topic, partition);
-        None
+        self.offsets
+            .get(group_id)?
+            .get(topic)?
+            .get(&partition)
+            .map(|(offset, _)| *offset)
+    }
+
+    /// 查询偏移量及元数据。
+    pub fn fetch_offset_with_meta(
+        &self,
+        group_id: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Option<(i64, Option<String>)> {
+        self.offsets.get(group_id)?.get(topic)?.get(&partition).cloned()
+    }
+
+    /// 列出所有消费者组（用于 ListGroups）。
+    /// 返回 (group_id, protocol_type)。
+    /// 合并了通过 JoinGroup 注册的组与通过 simple consumer OffsetCommit 注册的组。
+    pub fn list_groups(&self) -> Vec<(String, String)> {
+        let mut result: Vec<(String, String)> = Vec::new();
+        for g in self.groups.iter() {
+            result.push((g.group_id.clone(), g.protocol_type.clone()));
+        }
+        // 补充仅有 offset 提交、但未通过 JoinGroup 注册的组。
+        for offset_group in self.offsets.iter() {
+            let gid = offset_group.key().clone();
+            if !result.iter().any(|(id, _)| *id == gid) {
+                result.push((gid, String::new()));
+            }
+        }
+        result
+    }
+
+    /// 获取组的当前状态字符串（Empty/PreparingRebalance/CompletingRebalance/Stable）。
+    pub fn group_state_str(&self, group_id: &str) -> Option<String> {
+        self.groups.get(group_id).map(|g| match g.state {
+            GroupState::Empty => "Empty".to_string(),
+            GroupState::PreparingRebalance => "PreparingRebalance".to_string(),
+            GroupState::CompletingRebalance => "CompletingRebalance".to_string(),
+            GroupState::Stable => "Stable".to_string(),
+        })
+    }
+
+    /// 获取组的协议类型。
+    pub fn group_protocol_type(&self, group_id: &str) -> Option<String> {
+        self.groups.get(group_id).map(|g| g.protocol_type.clone())
+    }
+
+    /// 获取组的成员详情（用于 DescribeGroups）。
+    /// 返回 (members, 是否 leader 视角、协议名)。
+    pub fn describe_members(
+        &self,
+        group_id: &str,
+    ) -> Vec<(String, Bytes, Bytes)> {
+        self.groups
+            .get(group_id)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .map(|(id, m)| (id.clone(), m.metadata.clone(), m.assignment.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
