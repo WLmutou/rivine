@@ -219,6 +219,12 @@ impl RequestHandler {
         for t in &req.topic_data {
             let mut partitions = Vec::new();
             for p in &t.partitions {
+                // 主题或分区不存在时自动创建（模拟 auto.create.topics.enable=true）
+                if !self.metadata.partition_exists(&t.topic, p.partition_index) {
+                    let _ = self
+                        .metadata
+                        .create_topic(&t.topic, self.metadata.default_partitions(), false);
+                }
                 let result = self
                     .metadata
                     .append_records(&t.topic, p.partition_index, &[p.records.clone()])
@@ -314,7 +320,8 @@ impl RequestHandler {
         };
         // 简化响应：返回每个分区的 LEO
         let mut e = Encoder::new();
-        if header.api_version >= 1 {
+        // ListOffsets 的 ThrottleTimeMs 仅 v2+ 存在（v0-v1 响应无 throttle）
+        if header.api_version >= 2 {
             e.put_i32(0); // throttle_time_ms
         }
         e.put_i32(req.topics.len() as i32);
@@ -515,7 +522,10 @@ impl RequestHandler {
         };
         let err = self.groups.heartbeat(&req.group_id, req.generation_id, &req.member_id);
         let mut e = Encoder::new();
-        e.put_i32(0); // throttle_time_ms
+        // Heartbeat v0 无 throttle_time_ms；v1+ 才有
+        if header.api_version >= 1 {
+            e.put_i32(0); // throttle_time_ms
+        }
         e.put_i16(err);
         e.into_bytes()
     }
@@ -530,7 +540,10 @@ impl RequestHandler {
         };
         let err = self.groups.leave_group(&req.group_id, &req.member_id);
         let mut e = Encoder::new();
-        e.put_i32(0);
+        // LeaveGroup v0 无 throttle_time_ms；v1+ 才有
+        if header.api_version >= 1 {
+            e.put_i32(0);
+        }
         e.put_i16(err);
         e.into_bytes()
     }
@@ -545,7 +558,10 @@ impl RequestHandler {
         };
         // 单机实现：写内存（简化为空操作，返回成功）
         let mut e = Encoder::new();
-        e.put_i32(0);
+        // OffsetCommit 的 ThrottleTimeMs 仅 v3+ 存在（v0-v2 响应无 throttle）
+        if header.api_version >= 3 {
+            e.put_i32(0);
+        }
         e.put_i32(req.topics.len() as i32);
         for (topic, parts) in &req.topics {
             e.put_string(topic);

@@ -64,7 +64,10 @@ impl ApiVersionsResponse {
                 e.put_i16(k.max_version);
             }
         }
-        e.put_i32(self.throttle_time_ms);
+        // ThrottleTimeMs 仅 v1+ 存在（v0 响应无 throttle）
+        if version >= 1 {
+            e.put_i32(self.throttle_time_ms);
+        }
         if version >= 3 {
             write_tagged_fields(e);
         }
@@ -554,10 +557,13 @@ pub struct FindCoordinatorResponse {
 
 impl FindCoordinatorResponse {
     pub fn encode(&self, e: &mut Encoder, version: i16) {
-        e.put_i32(self.throttle_time_ms);
+        // ThrottleTimeMs 仅 v1+ 存在；v0 响应为 error + node_id + host + port
         if version >= 1 {
+            e.put_i32(self.throttle_time_ms);
             e.put_i16(self.error_code);
             e.put_nullable_string(self.error_message.as_deref());
+        } else {
+            e.put_i16(self.error_code);
         }
         e.put_i32(self.node_id);
         e.put_string(&self.host);
@@ -685,7 +691,10 @@ pub struct SyncGroupResponse {
 
 impl SyncGroupResponse {
     pub fn encode(&self, e: &mut Encoder, version: i16) {
-        e.put_i32(self.throttle_time_ms);
+        // ThrottleTimeMs 仅 v1+ 存在；v0 响应为 error_code + assignment
+        if version >= 1 {
+            e.put_i32(self.throttle_time_ms);
+        }
         e.put_i16(self.error_code);
         if version >= 5 {
             // compact bytes
@@ -819,7 +828,10 @@ pub struct OffsetFetchResponse {
 
 impl OffsetFetchResponse {
     pub fn encode(&self, e: &mut Encoder, version: i16) {
-        e.put_i32(self.throttle_time_ms);
+        // ThrottleTimeMs 仅 v3+ 存在（v0-v2 响应无 throttle）
+        if version >= 3 {
+            e.put_i32(self.throttle_time_ms);
+        }
         e.put_i32(self.topics.len() as i32);
         for (topic, parts) in &self.topics {
             e.put_string(topic);
