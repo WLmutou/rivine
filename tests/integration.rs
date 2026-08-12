@@ -57,16 +57,14 @@ fn build_api_versions_request(correlation_id: i32) -> Vec<u8> {
 /// 构建 Produce v3 请求，写入一个 RecordBatch。
 fn build_produce_request(correlation_id: i32, topic: &str, partition: i32, value: &str) -> Vec<u8> {
     let mut e = Encoder::new();
-    // header v2 (api_key != 18)，带 tagged fields
+    // Produce v3 为非 flexible，请求头为 header v1（不带 tagged fields）
     e.put_i16(0); // Produce
     e.put_i16(3);
     e.put_i32(correlation_id);
     e.put_i16(-1); // client_id null
-    // header v2 需要 tagged fields（请求头版本 2）
-    e.put_unsigned_varint(0);
 
-    // body v3（非紧凑格式）
-    e.put_nullable_compact_string(None); // transactional_id (v3+ 用紧凑)
+    // body v3（非紧凑格式）：transactional_id 为传统 nullable string
+    e.put_nullable_string(None); // transactional_id
     e.put_i16(1); // acks
     e.put_i32(1000); // timeout_ms
     // topic_data 数组（v3 非紧凑）
@@ -96,7 +94,7 @@ fn build_fetch_request(correlation_id: i32, topic: &str, partition: i32, offset:
     e.put_i16(4);
     e.put_i32(correlation_id);
     e.put_i16(-1); // client_id null
-    e.put_unsigned_varint(0); // header v2 tagged
+    // Fetch v4 为非 flexible，请求头为 header v1（不带 tagged fields）
 
     // body v4
     e.put_i32(-1); // replica_id
@@ -216,7 +214,9 @@ async fn test_produce_then_fetch() {
     assert_eq!(err, 0, "Fetch 应成功");
     let _hw = d2.get_i64().unwrap();
     let _lso = d2.get_i64().unwrap();
-    // Fetch v4 不包含 log_start_offset（v5+ 才有）
+    // Fetch v4 不包含 log_start_offset（v5+ 才有），但包含 aborted_transactions(v4+)
+    let n_aborted = d2.get_i32().unwrap();
+    assert_eq!(n_aborted, 0, "无事务，应无 aborted_transactions");
     let records_len = d2.get_i32().unwrap();
     assert!(records_len > 0, "应取回消息数据，records_len={records_len}");
     let records = d2.get_bytes(records_len as usize).unwrap();

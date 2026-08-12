@@ -126,31 +126,36 @@ impl RecordBatch {
             m.max(base_timestamp + r.timestamp_delta)
         });
 
-        // 1. 序列化 records 部分（不含压缩时直接写入）
+        // 1. 序列化 records 部分（不含压缩时直接写入）。
+        //    每个 record 以 length(varint) 开头，body 内 timestamp_delta 用 varlong、
+        //    offset_delta/各长度/header 数量用 varint（与 Kafka 消息格式 v2 一致）。
         let mut records_buf = BytesMut::new();
         for r in &records {
-            records_buf.put_i8(r.attributes);
-            records_buf.put_i64(r.timestamp_delta);
-            records_buf.put_i32(r.offset_delta);
-            put_varint_len(&mut records_buf, r.key.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
+            let mut body = BytesMut::new();
+            body.put_i8(r.attributes);
+            put_varlong(&mut body, r.timestamp_delta);
+            put_varint_len(&mut body, r.offset_delta as i64);
+            put_varint_len(&mut body, r.key.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
             if let Some(k) = &r.key {
-                records_buf.put_slice(k);
+                body.put_slice(k);
             }
-            put_varint_len(&mut records_buf, r.value.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
+            put_varint_len(&mut body, r.value.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
             if let Some(v) = &r.value {
-                records_buf.put_slice(v);
+                body.put_slice(v);
             }
-            records_buf.put_i32(r.headers.len() as i32);
+            put_varint_len(&mut body, r.headers.len() as i64);
             for (k, v) in &r.headers {
-                records_buf.put_i8(0); // header key len
+                body.put_i8(0); // header key length 之后的属性（无压缩时固定 0）
                 let kb = k.as_bytes();
-                put_varint_len(&mut records_buf, kb.len() as i64);
-                records_buf.put_slice(kb);
-                put_varint_len(&mut records_buf, v.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
+                put_varint_len(&mut body, kb.len() as i64);
+                body.put_slice(kb);
+                put_varint_len(&mut body, v.as_ref().map(|b| b.len() as i64).unwrap_or(-1));
                 if let Some(vb) = v {
-                    records_buf.put_slice(vb);
+                    body.put_slice(vb);
                 }
             }
+            put_varint_len(&mut records_buf, body.len() as i64);
+            records_buf.put_slice(&body);
         }
 
         // 2. 压缩 records
@@ -170,8 +175,9 @@ impl RecordBatch {
         body.put_i32(records.len() as i32);
         body.put_slice(&records_compressed);
 
-        // 4. 计算 CRC（覆盖 attributes 到 records 结束）
-        let crc = crc32fast::hash(&body);
+        // 4. 计算 CRC（覆盖 attributes 到 records 结束）。
+        //    Kafka 消息格式 v2 使用 CRC32C（Castagnoli），而非标准 CRC32。
+        let crc = crc32c::crc32c(&body);
 
         // 5. 组装完整 batch
         // batch_length = 从 batchLength 字段之后到批次末尾 = epoch(4)+magic(1)+crc(4)+body
@@ -200,7 +206,7 @@ impl RecordBatch {
         let crc_stored = cur.get_u32();
         // crc 覆盖范围：从 attributes 开始到 records 结束（batch_length 减去 magic 和 crc 长度）。
         let crc_len = batch_length as usize - 4 - 1 - 4;
-        let crc_computed = crc32fast::hash(&raw[cur.position() as usize..cur.position() as usize + crc_len]);
+        let crc_computed = crc32c::crc32c(&raw[cur.position() as usize..cur.position() as usize + crc_len]);
         if crc_stored != crc_computed {
             // 允许容忍：某些实现校验失败，这里仅警告不返回错误（读取路径由上层处理）
             tracing::warn!(
@@ -251,6 +257,11 @@ fn attributes_flags(_compression: Compression) -> i16 {
 
 fn put_varint_len(buf: &mut BytesMut, len: i64) {
     // Kafka varint 是有符号的 zigzag + 无符号 varint
+    put_varlong(buf, len);
+}
+
+/// 写入 zigzag 编码的有符号变长整数（Kafka varint/varlong）。
+fn put_varlong(buf: &mut BytesMut, len: i64) {
     let zigzag = ((len << 1) ^ (len >> 63)) as u64;
     put_uvarint(buf, zigzag);
 }
@@ -273,58 +284,93 @@ fn parse_records(data: &[u8], count: i32) -> Result<Vec<Record>> {
     let mut pos = 0usize;
     let mut records = Vec::new();
     for _ in 0..count {
-        let attr = data[pos] as i8;
-        pos += 1;
-        let timestamp_delta = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let offset_delta = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let key_len = read_varint(data, &mut pos)?;
-        let key = if key_len >= 0 {
-            let k = data[pos..pos + key_len as usize].to_vec();
-            pos += key_len as usize;
-            Some(Bytes::from(k))
-        } else {
-            None
-        };
-        let value_len = read_varint(data, &mut pos)?;
-        let value = if value_len >= 0 {
-            let v = data[pos..pos + value_len as usize].to_vec();
-            pos += value_len as usize;
+        // 每个 record 以 length(varint, zigzag) 开头，表示 record body 的字节长度。
+        let rec_len = read_varint(data, &mut pos)?;
+        if rec_len < 0 {
+            return Err(Error::Decode("非法 record 长度".into()));
+        }
+        let end = pos + rec_len as usize;
+        if end > data.len() {
+            return Err(Error::Decode("record 越界".into()));
+        }
+        let r = parse_single_record(data, &mut pos, end)?;
+        pos = end;
+        records.push(r);
+    }
+    Ok(records)
+}
+
+/// 解析单个 record 的 body（不含前导 length），从 pos 到 end。
+fn parse_single_record(data: &[u8], pos: &mut usize, end: usize) -> Result<Record> {
+    if *pos + 1 > end {
+        return Err(Error::Decode("record 数据不足".into()));
+    }
+    let attr = data[*pos] as i8;
+    *pos += 1;
+    let timestamp_delta = read_varlong(data, pos)?;
+    let offset_delta = read_varint(data, pos)? as i32;
+    let key_len = read_varint(data, pos)?;
+    let key = if key_len >= 0 {
+        let k = data[*pos..*pos + key_len as usize].to_vec();
+        *pos += key_len as usize;
+        Some(Bytes::from(k))
+    } else {
+        None
+    };
+    let value_len = read_varint(data, pos)?;
+    let value = if value_len >= 0 {
+        let v = data[*pos..*pos + value_len as usize].to_vec();
+        *pos += value_len as usize;
+        Some(Bytes::from(v))
+    } else {
+        None
+    };
+    let n_headers = read_varint(data, pos)? as i32;
+    let mut headers = Vec::new();
+    for _ in 0..n_headers {
+        let _header_attr = data[*pos] as i8;
+        *pos += 1;
+        let hk_len = read_varint(data, pos)?;
+        let hk = String::from_utf8(data[*pos..*pos + hk_len as usize].to_vec())
+            .map_err(|e| Error::Decode(format!("header key utf8: {e}")))?;
+        *pos += hk_len as usize;
+        let hv_len = read_varint(data, pos)?;
+        let hv = if hv_len >= 0 {
+            let v = data[*pos..*pos + hv_len as usize].to_vec();
+            *pos += hv_len as usize;
             Some(Bytes::from(v))
         } else {
             None
         };
-        let n_headers = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let mut headers = Vec::new();
-        for _ in 0..n_headers {
-            let _header_attr = data[pos] as i8;
-            pos += 1;
-            let hk_len = read_varint(data, &mut pos)?;
-            let hk = String::from_utf8(data[pos..pos + hk_len as usize].to_vec())
-                .map_err(|e| Error::Decode(format!("header key utf8: {e}")))?;
-            pos += hk_len as usize;
-            let hv_len = read_varint(data, &mut pos)?;
-            let hv = if hv_len >= 0 {
-                let v = data[pos..pos + hv_len as usize].to_vec();
-                pos += hv_len as usize;
-                Some(Bytes::from(v))
-            } else {
-                None
-            };
-            headers.push((hk, hv));
-        }
-        records.push(Record {
-            attributes: attr,
-            timestamp_delta,
-            offset_delta,
-            key,
-            value,
-            headers,
-        });
+        headers.push((hk, hv));
     }
-    Ok(records)
+    Ok(Record {
+        attributes: attr,
+        timestamp_delta,
+        offset_delta,
+        key,
+        value,
+        headers,
+    })
+}
+
+/// 读取 varlong（zigzag 编码的 64 位有符号）。
+fn read_varlong(data: &[u8], pos: &mut usize) -> Result<i64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        if *pos >= data.len() {
+            return Err(Error::Decode("varlong 越界".into()));
+        }
+        let byte = data[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(((result >> 1) as i64) ^ -((result & 1) as i64))
 }
 
 fn read_varint(data: &[u8], pos: &mut usize) -> Result<i64> {

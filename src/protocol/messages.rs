@@ -76,6 +76,8 @@ impl ApiVersionsResponse {
 #[derive(Debug, Clone)]
 pub struct MetadataRequest {
     pub topics: Vec<String>,
+    /// 主题不存在时是否允许 broker 自动创建（v4+）
+    pub allow_auto_topic_creation: bool,
 }
 
 impl MetadataRequest {
@@ -103,7 +105,17 @@ impl MetadataRequest {
                 topics
             }
         };
-        Ok(Self { topics })
+        // v4 起有 allow_auto_topic_creation（bool），v8 起另有 include_cluster/topic
+        // authorized_operations（bool）。仅解析 v4-v7 的 allow_auto_topic_creation。
+        let allow_auto_topic_creation = if (4..=7).contains(&version) {
+            buf.get_i8()? != 0
+        } else {
+            false
+        };
+        Ok(Self {
+            topics,
+            allow_auto_topic_creation,
+        })
     }
 }
 
@@ -217,13 +229,19 @@ pub struct ProduceRequest {
 
 impl ProduceRequest {
     pub fn decode(buf: &mut Decoder, version: i16) -> Result<Self> {
-        let transactional_id = if version >= 3 {
+        // transactional_id 字段：v3-v8 为传统 nullable_string，v9+（flexible）为 compact。
+        // 本 Broker 支持到 v3，按传统格式解析。
+        let transactional_id = if version >= 9 {
             buf.get_nullable_compact_string()?
+        } else if version >= 3 {
+            buf.get_nullable_string()?
         } else {
             None
         };
         let acks = buf.get_i16()?;
         let timeout_ms = buf.get_i32()?;
+        // 注意：幂等生产者所需 producer_id/producer_epoch/base_sequence 位于
+        // RecordBatch 内部（消息格式 v2），不在 Produce 请求顶层。
         let n_topics = if version >= 9 {
             buf.get_unsigned_varint()? as usize
         } else {
@@ -449,7 +467,7 @@ impl FetchResponse {
                 if version >= 5 {
                     e.put_i64(p.log_start_offset);
                 }
-                if version >= 7 {
+                if version >= 4 {
                     e.put_i32(p.aborted_transactions.len() as i32);
                     for a in &p.aborted_transactions {
                         e.put_i64(a.producer_id);
@@ -474,6 +492,10 @@ pub struct ListOffsetsRequest {
 impl ListOffsetsRequest {
     pub fn decode(buf: &mut Decoder, version: i16) -> Result<Self> {
         let replica_id = buf.get_i32()?;
+        // v2+ 引入 isolation_level(int8)
+        if version >= 2 {
+            let _isolation = buf.get_i8()?;
+        }
         let n_topics = buf.get_i32()?;
         let mut topics = Vec::new();
         for _ in 0..n_topics {
@@ -482,9 +504,20 @@ impl ListOffsetsRequest {
             let mut parts = Vec::new();
             for _ in 0..n_part {
                 let partition = buf.get_i32()?;
-                let timestamp = buf.get_i64()?;
-                let max_num = if version >= 2 { buf.get_i32()? } else { 1 };
-                parts.push((partition, 0i8, timestamp, max_num));
+                // v0：partition_index + timestamp + max_num_offsets
+                // v1-v3：partition_index + timestamp
+                // v4+：partition_index + current_leader_epoch + timestamp
+                if version == 0 {
+                    let timestamp = buf.get_i64()?;
+                    let max_num = buf.get_i32()?;
+                    parts.push((partition, 0i8, timestamp, max_num));
+                } else {
+                    if version >= 4 {
+                        let _current_leader_epoch = buf.get_i32()?;
+                    }
+                    let timestamp = buf.get_i64()?;
+                    parts.push((partition, 0i8, timestamp, 1));
+                }
             }
             topics.push((topic, parts));
         }
@@ -588,18 +621,25 @@ impl JoinGroupResponse {
         e.put_i32(self.throttle_time_ms);
         e.put_i16(self.error_code);
         e.put_i32(self.generation_id);
+        // ProtocolType 字段 v7+ 才存在；v0-6 响应没有该字段。
         if version >= 7 {
             e.put_nullable_compact_string(self.protocol_type.as_deref());
             e.put_nullable_compact_string(self.protocol_name.as_deref());
         } else {
-            e.put_nullable_string(self.protocol_type.as_deref());
+            // ProtocolName 字段 v0+ 存在（传统格式）
             e.put_nullable_string(self.protocol_name.as_deref());
         }
         e.put_string(&self.leader);
+        if version >= 9 {
+            e.put_i8(0); // skip_assignment = false
+        }
         e.put_string(&self.member_id);
         e.put_i32(self.members.len() as i32);
         for (mid, meta) in &self.members {
             e.put_string(mid);
+            if version >= 5 {
+                e.put_nullable_string(None); // group_instance_id
+            }
             e.put_i32(meta.len() as i32);
             e.put_bytes(meta);
         }
@@ -723,8 +763,13 @@ impl OffsetCommitRequest {
             for _ in 0..n_part {
                 let partition = buf.get_i32()?;
                 let offset = buf.get_i64()?;
-                let ts = if version >= 1 { buf.get_i64()? } else { -1 };
-                let metadata = if version >= 6 { buf.get_nullable_string()? } else { buf.get_nullable_string()? };
+                // CommitTimestamp 仅 v1 存在；v0/v2+ 无该字段。
+                let ts = if version == 1 { buf.get_i64()? } else { -1 };
+                // CommittedLeaderEpoch 仅 v6-v8 存在（非 flexible 时的显式字段）
+                if version >= 6 {
+                    let _epoch = buf.get_i32()?;
+                }
+                let metadata = buf.get_nullable_string()?;
                 parts.push((partition, offset, metadata, ts));
             }
             topics.push((topic, parts));

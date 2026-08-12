@@ -34,6 +34,7 @@ pub mod apikey {
     pub const API_VERSIONS: i16 = 18;
     pub const CREATE_TOPICS: i16 = 19;
     pub const DELETE_TOPICS: i16 = 20;
+    pub const INIT_PRODUCER_ID: i16 = 22;
 }
 
 /// Kafka 错误码
@@ -89,9 +90,9 @@ impl RequestHeader {
         let correlation_id = buf.get_i32()?;
         // 请求头本身不包含 header_version 字段，API key 决定 header_version。
         let client_id = buf.get_nullable_string()?;
-        // 对于 header_version >= 2 的请求，需要读取 tagged fields。
-        // 这里仅简单处理：如果 api_version 达到相应版本，则消费 tagged fields。
-        if header_version(api_key) >= 2 {
+        // 若该 API 的该版本使用 flexible（紧凑）请求头，则需要消费 tagged fields。
+        // 请求头是否 flexible 由该 API 的 flexibleVersions 决定（KIP-482）。
+        if request_header_is_flexible(api_key, api_version) {
             let _ = read_tagged_fields(buf)?;
         }
         Ok(Self {
@@ -103,14 +104,36 @@ impl RequestHeader {
     }
 }
 
-/// 返回某个 API 使用的请求头版本（Kafka 定义 header_version 由 api_key 决定）。
-fn header_version(api_key: i16) -> i16 {
-    // 简化：所有请求在 v2+ 使用 header_version 2。ApiVersions 用 header_version 1。
+/// 该 API 在指定版本下是否使用 flexible（紧凑）请求头。
+///
+/// Kafka 中请求头是否 flexible 由各 API 的 `flexibleVersions` 决定：
+/// 版本达到该阈值后，请求头才带 tagged fields（header_version 2），
+/// 之前的版本为传统请求头（header_version 1，不带 tagged fields）。
+fn request_header_is_flexible(api_key: i16, api_version: i16) -> bool {
+    // ApiVersions 的请求头永远为 v1（KIP-482 例外，协商版本前无法使用 v2 请求头）。
     if api_key == apikey::API_VERSIONS {
-        1
-    } else {
-        2
+        return false;
     }
+    // 每个 API 引入 flexible（紧凑）格式的最低版本
+    let flexible_since: i16 = match api_key {
+        apikey::PRODUCE => 9,
+        apikey::FETCH => 12,
+        apikey::LIST_OFFSETS => 6,
+        apikey::METADATA => 9,
+        apikey::OFFSET_COMMIT => 8,
+        apikey::OFFSET_FETCH => 6,
+        apikey::FIND_COORDINATOR => 3,
+        apikey::JOIN_GROUP => 6,
+        apikey::HEARTBEAT => 4,
+        apikey::LEAVE_GROUP => 4,
+        apikey::SYNC_GROUP => 4,
+        apikey::API_VERSIONS => 3,
+        apikey::CREATE_TOPICS => 5,
+        apikey::DELETE_TOPICS => 4,
+        // 未知 API 默认不消费 tagged fields
+        _ => i16::MAX,
+    };
+    api_version >= flexible_since
 }
 
 /// 读取 tagged fields（紧凑协议），返回字段数量并跳过内容。

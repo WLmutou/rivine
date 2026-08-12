@@ -201,6 +201,11 @@ impl MetadataManager {
         self.topics.len()
     }
 
+    /// 创建主题时的默认分区数（auto.create.topics 时使用）。
+    pub fn default_partitions(&self) -> i32 {
+        self.config.num_partitions.max(1)
+    }
+
     /// 主题内分区数。
     pub fn partitions_of(&self, topic: &str) -> i32 {
         self.topics

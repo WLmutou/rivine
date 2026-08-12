@@ -9,8 +9,12 @@ use crate::group::GroupCoordinator;
 use crate::metrics::Metrics;
 use crate::protocol::*;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// 幂等生产者 ID 分配器（单机递增，>=0 为有效 producer_id）。
+static NEXT_PRODUCER_ID: AtomicI64 = AtomicI64::new(0);
 
 /// 请求处理器：为每个连接创建一份（持有共享状态）。
 pub struct RequestHandler {
@@ -72,6 +76,7 @@ impl RequestHandler {
             apikey::LIST_OFFSETS => self.handle_list_offsets(&header, decoder),
             apikey::CREATE_TOPICS => self.handle_create_topics(&header, decoder),
             apikey::DELETE_TOPICS => self.handle_delete_topics(&header, decoder),
+            apikey::INIT_PRODUCER_ID => self.handle_init_producer_id(&header, decoder),
             apikey::FIND_COORDINATOR => self.handle_find_coordinator(&header, decoder),
             apikey::JOIN_GROUP => self.handle_join_group(&header, decoder),
             apikey::SYNC_GROUP => self.handle_sync_group(&header, decoder),
@@ -98,7 +103,7 @@ impl RequestHandler {
     }
 
     // ---------------- ApiVersions ----------------
-    fn handle_api_versions(&self, _header: &RequestHeader) -> Bytes {
+    fn handle_api_versions(&self, header: &RequestHeader) -> Bytes {
         let resp = ApiVersionsResponse {
             error_code: error_codes::NONE,
             api_keys: crate::SUPPORTED_API_KEYS
@@ -111,20 +116,32 @@ impl RequestHandler {
                 .collect(),
             throttle_time_ms: 0,
         };
+        // 响应格式随客户端请求的 api_version 变化（v0-v2 传统，v3+ 紧凑）
         let mut e = Encoder::new();
-        resp.encode(&mut e, 3);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 
     // ---------------- Metadata ----------------
-    fn handle_metadata(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match MetadataRequest::decode(decoder, 13) {
+    fn handle_metadata(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match MetadataRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Metadata 解码失败: {e}");
                 return Bytes::new();
             }
         };
+        // 若客户端允许自动创建主题，则对不存在的非内部主题自动创建。
+        if req.allow_auto_topic_creation {
+            for t in &req.topics {
+                if self.metadata.get_topic(t).is_none() {
+                    let _ = self
+                        .metadata
+                        .create_topic(t, self.metadata.default_partitions(), false);
+                }
+            }
+        }
+
         let topics = if req.topics.is_empty() {
             self.metadata.topic_list()
         } else {
@@ -185,7 +202,7 @@ impl RequestHandler {
             topics: topics_meta,
         };
         let mut e = Encoder::new();
-        resp.encode(&mut e, 13);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 
@@ -287,8 +304,8 @@ impl RequestHandler {
     }
 
     // ---------------- ListOffsets ----------------
-    fn handle_list_offsets(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match ListOffsetsRequest::decode(decoder, 2) {
+    fn handle_list_offsets(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match ListOffsetsRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("ListOffsets 解码失败: {e}");
@@ -297,6 +314,9 @@ impl RequestHandler {
         };
         // 简化响应：返回每个分区的 LEO
         let mut e = Encoder::new();
+        if header.api_version >= 1 {
+            e.put_i32(0); // throttle_time_ms
+        }
         e.put_i32(req.topics.len() as i32);
         for (topic, parts) in &req.topics {
             e.put_string(topic);
@@ -305,11 +325,24 @@ impl RequestHandler {
                 let leo = self.metadata.partition_leo_sync(topic, *partition).unwrap_or(0);
                 e.put_i32(*partition);
                 e.put_i16(error_codes::NONE);
-                if *ts < 0 {
-                    e.put_i64(leo);
+                if header.api_version >= 1 {
+                    // v1+ 响应：timestamp + offset 两个 int64
+                    if *ts == -2 {
+                        // earliest：从日志起始偏移开始
+                        e.put_i64(-1); // timestamp 未知
+                        e.put_i64(0);
+                    } else if *ts == -1 {
+                        // latest：返回 LEO
+                        e.put_i64(-1);
+                        e.put_i64(leo);
+                    } else {
+                        e.put_i64(*ts);
+                        e.put_i64(leo);
+                    }
                 } else {
-                    e.put_i64(leo);
-                    e.put_i64(*ts);
+                    // v0 响应：old_style_offsets (int32 array)
+                    e.put_i32(1); // 1 个 offset
+                    e.put_i32(leo as i32);
                 }
             }
         }
@@ -317,14 +350,15 @@ impl RequestHandler {
     }
 
     // ---------------- CreateTopics / DeleteTopics ----------------
-    fn handle_create_topics(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match CreateTopicsRequest::decode(decoder, 4) {
+    fn handle_create_topics(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match CreateTopicsRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("CreateTopics 解码失败: {e}");
                 return Bytes::new();
             }
         };
+        let ver = header.api_version;
         let mut e = Encoder::new();
         e.put_i32(req.topics.len() as i32);
         for (name, num_partitions, _rf, _configs) in &req.topics {
@@ -334,25 +368,27 @@ impl RequestHandler {
             };
             e.put_string(name);
             e.put_i16(err);
-            if 4 >= 1 {
-                e.put_i16(-1); // error_message
+            if ver >= 1 {
+                e.put_i16(-1); // error_message (null)
             }
-            if 4 >= 2 {
-                e.put_i32(1); // num_partitions
+            if ver >= 2 {
+                e.put_i32(*num_partitions); // num_partitions
             }
-            if 4 >= 2 {
+            if ver >= 2 {
                 e.put_i16(1); // replication_factor
             }
-            if 4 >= 5 {
+            if ver >= 5 {
                 e.put_i32(0); // configs count
             }
         }
-        e.put_i32(req.timeout_ms);
+        if ver >= 2 {
+            e.put_i32(0); // throttle_time_ms
+        }
         e.into_bytes()
     }
 
-    fn handle_delete_topics(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match DeleteTopicsRequest::decode(decoder, 4) {
+    fn handle_delete_topics(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match DeleteTopicsRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("DeleteTopics 解码失败: {e}");
@@ -369,13 +405,34 @@ impl RequestHandler {
             e.put_string(name);
             e.put_i16(err);
         }
-        e.put_i32(req.timeout_ms);
+        if header.api_version >= 1 {
+            e.put_i32(0); // throttle_time_ms
+        }
+        e.into_bytes()
+    }
+
+    // ---------------- InitProducerId（幂等生产者） ----------------
+    fn handle_init_producer_id(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        // v0-v1 请求体仅含 transactional_id（nullable string）。
+        let _ = match decoder.get_nullable_string() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("InitProducerId 解码失败: {e}");
+                return Bytes::new();
+            }
+        };
+        let producer_id = NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed);
+        let mut e = Encoder::new();
+        e.put_i32(0); // throttle_time_ms
+        e.put_i16(error_codes::NONE);
+        e.put_i64(producer_id);
+        e.put_i16(0); // producer_epoch
         e.into_bytes()
     }
 
     // ---------------- 消费者组 ----------------
-    fn handle_find_coordinator(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match FindCoordinatorRequest::decode(decoder, 3) {
+    fn handle_find_coordinator(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match FindCoordinatorRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("FindCoordinator 解码失败: {e}");
@@ -392,12 +449,12 @@ impl RequestHandler {
             port: self.broker_port,
         };
         let mut e = Encoder::new();
-        resp.encode(&mut e, 3);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 
-    fn handle_join_group(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match JoinGroupRequest::decode(decoder, 6) {
+    fn handle_join_group(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match JoinGroupRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("JoinGroup 解码失败: {e}");
@@ -423,12 +480,12 @@ impl RequestHandler {
             members,
         };
         let mut e = Encoder::new();
-        resp.encode(&mut e, 6);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 
-    fn handle_sync_group(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match SyncGroupRequest::decode(decoder, 4) {
+    fn handle_sync_group(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match SyncGroupRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("SyncGroup 解码失败: {e}");
@@ -444,12 +501,12 @@ impl RequestHandler {
             assignment,
         };
         let mut e = Encoder::new();
-        resp.encode(&mut e, 4);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 
-    fn handle_heartbeat(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match HeartbeatRequest::decode(decoder, 4) {
+    fn handle_heartbeat(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match HeartbeatRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Heartbeat 解码失败: {e}");
@@ -463,8 +520,8 @@ impl RequestHandler {
         e.into_bytes()
     }
 
-    fn handle_leave_group(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match LeaveGroupRequest::decode(decoder, 3) {
+    fn handle_leave_group(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match LeaveGroupRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("LeaveGroup 解码失败: {e}");
@@ -478,8 +535,8 @@ impl RequestHandler {
         e.into_bytes()
     }
 
-    fn handle_offset_commit(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match OffsetCommitRequest::decode(decoder, 8) {
+    fn handle_offset_commit(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match OffsetCommitRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("OffsetCommit 解码失败: {e}");
@@ -501,8 +558,8 @@ impl RequestHandler {
         e.into_bytes()
     }
 
-    fn handle_offset_fetch(&self, _header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
-        let req = match OffsetFetchRequest::decode(decoder, 5) {
+    fn handle_offset_fetch(&self, header: &RequestHeader, decoder: &mut Decoder) -> Bytes {
+        let req = match OffsetFetchRequest::decode(decoder, header.api_version) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("OffsetFetch 解码失败: {e}");
@@ -523,7 +580,7 @@ impl RequestHandler {
             error_code: error_codes::NONE,
         };
         let mut e = Encoder::new();
-        resp.encode(&mut e, 5);
+        resp.encode(&mut e, header.api_version);
         e.into_bytes()
     }
 }

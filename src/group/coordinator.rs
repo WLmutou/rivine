@@ -108,6 +108,20 @@ impl GroupCoordinator {
             .entry(group_id.to_string())
             .or_insert_with(|| Group::new(group_id));
 
+        // 清理超过 session 超时未心跳的成员（模拟 Kafka 的成员过期机制）。
+        let now = Instant::now();
+        let expired: Vec<String> = group
+            .members
+            .iter()
+            .filter(|(_, m)| {
+                now.duration_since(m.last_heartbeat).as_millis() > m.session_timeout_ms as u128
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            group.members.remove(&id);
+        }
+
         let member_id = if member_id.is_empty() {
             format!("rivine-{}-{}", group_id, group.members.len() + 1)
         } else {
@@ -121,6 +135,8 @@ impl GroupCoordinator {
             group.protocol = None;
         }
 
+        // 选取第一个协议作为该成员的协议元数据（KafkaConsumer 的订阅信息）。
+        let metadata = protocols.first().map(|(_, m)| m.clone()).unwrap_or_default();
         let member = Member {
             member_id: member_id.clone(),
             session_timeout_ms,
@@ -128,7 +144,7 @@ impl GroupCoordinator {
             protocols,
             last_heartbeat: Instant::now(),
             assignment: Bytes::new(),
-            metadata: Bytes::new(),
+            metadata: metadata.clone(),
         };
         group.members.insert(member_id.clone(), member);
         group.protocol_type = protocol_type.to_string();

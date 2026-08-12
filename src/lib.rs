@@ -31,21 +31,27 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 本 Broker 支持的 API 版本范围（Kafka 协议中的 ApiVersions 响应）
+/// 本 Broker 支持的 API 版本范围（Kafka 协议中的 ApiVersions 响应）。
+///
+/// 说明：Broker 的请求/响应编解码目前主要实现的是**传统（非紧凑）格式**，
+/// 因此这里声明的 max_version 都被限制在各 API 引入紧凑格式（flexible）之前的
+/// 旧版本。这样 kafka-python 等标准客户端在 ApiVersions 协商后会选用传统格式，
+/// 与 Broker 的编解码保持一致；同时 Produce 仍使用 v3（RecordBatch magic=2），
+/// 与存储层的消息格式匹配。
 pub const SUPPORTED_API_KEYS: &[(i16, i16, i16)] = &[
-    (0, 0, 3),   // Produce
-    (1, 0, 15),  // Fetch
-    (2, 0, 13),  // ListOffsets
-    (3, 0, 13),  // Metadata
-    (8, 0, 3),   // OffsetCommit
-    (9, 0, 9),   // OffsetFetch
-    (10, 0, 6),  // FindCoordinator
-    (11, 0, 9),  // JoinGroup
-    (12, 0, 7),  // Heartbeat
-    (13, 0, 7),  // LeaveGroup
-    (14, 0, 5),  // SyncGroup
-    (18, 0, 4),  // ApiVersions
-    (19, 0, 2),  // CreateTopics
-    (20, 0, 7),  // DeleteTopics
-    (32, 0, 1),  // SASLHandshake (最小占位)
+    (0, 0, 3),   // Produce (v3: 传统格式 + RecordBatch magic=2)
+    (1, 0, 5),   // Fetch (flexible 自 v12 起，限到 v5 传统格式)
+    (2, 0, 2),   // ListOffsets (flexible 自 v6 起，限到 v2 传统格式)
+    (3, 0, 4),   // Metadata (flexible 自 v9 起，限到 v4 传统格式)
+    (8, 0, 3),   // OffsetCommit (flexible 自 v8 起，限到 v3 传统格式)
+    (9, 0, 3),   // OffsetFetch (flexible 自 v6 起，限到 v3 传统格式)
+    (10, 0, 1),  // FindCoordinator (flexible 自 v4 起，限到 v1 传统格式)
+    (11, 0, 2),  // JoinGroup (flexible 自 v6 起，限到 v2 传统格式)
+    (12, 0, 1),  // Heartbeat (flexible 自 v4 起，限到 v1 传统格式)
+    (13, 0, 1),  // LeaveGroup (flexible 自 v5 起，限到 v1 传统格式)
+    (14, 0, 1),  // SyncGroup (flexible 自 v5 起，限到 v1 传统格式)
+    (18, 0, 3),  // ApiVersions (v0-v2 传统，v3+ 紧凑；按请求版本动态编码)
+    (19, 0, 2),  // CreateTopics (flexible 自 v5 起，限到 v2 传统格式)
+    (20, 0, 1),  // DeleteTopics (flexible 自 v4 起，限到 v1 传统格式)
+    (22, 0, 1),  // InitProducerId (flexible 自 v2 起，限到 v1 传统格式，支持幂等生产者)
 ];
